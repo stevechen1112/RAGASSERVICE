@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.9, "3.10", "3.11"]
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest-xdist  # 並行測試
+    
+    - name: Lint with flake8
+      run: |
+        # 停止構建如果有 Python 語法錯誤或未定義的名稱
+        flake8 src --count --select=E9,F63,F7,F82 --show-source --statistics
+        # 退出零處理所有錯誤為警告。GitHub 編輯器寬度為 127 個字符
+        flake8 src --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+    
+    - name: Format check with black
+      run: |
+        black --check src
+    
+    - name: Type check with mypy
+      run: |
+        mypy src --ignore-missing-imports
+    
+    - name: Test with pytest
+      env:
+        DATABASE_URL: postgresql://postgres:testpassword@localhost:5432/testdb
+        REDIS_URL: redis://localhost:6379
+        ENVIRONMENT: testing
+      run: |
+        pytest src/tests --cov=src --cov-report=xml --cov-report=term-missing -n auto
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run security checks with bandit
+      run: |
+        pip install bandit
+        bandit -r src -f json -o bandit-report.json
+    
+    - name: Upload security scan results
+      uses: actions/upload-artifact@v3
+      with:
+        name: bandit-report
+        path: bandit-report.json
+
+  build:
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build Docker image
+      run: |
+        docker build -t ragasservice:${{ github.sha }} .
+    
+    - name: Test Docker image
+      run: |
+        docker run --rm ragasservice:${{ github.sha }} python -c "import src; print('Import successful')" 
